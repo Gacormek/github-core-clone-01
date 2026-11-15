@@ -676,7 +676,11 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, ctx:
     }
     if (method === 'POST') {
       const input = asRecord(body);
-      const name = input === null ? null : asString(input.name);
+      if (input === null) {
+        sendError(res, 422, 'Repository name is required');
+        return true;
+      }
+      const name = asString(input.name);
       if (name === null || !isValidRepoName(name)) {
         sendError(res, 422, 'Repository name is required');
         return true;
@@ -792,7 +796,11 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, ctx:
       }
       if (method === 'POST') {
         const input = asRecord(body);
-        const labelName = input === null ? null : asString(input.name);
+        if (input === null) {
+          sendError(res, 422, 'Label name is required');
+          return true;
+        }
+        const labelName = asString(input.name);
         if (labelName === null || labelName === '') {
           sendError(res, 422, 'Label name is required');
           return true;
@@ -839,7 +847,11 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, ctx:
       }
       if (method === 'POST') {
         const input = asRecord(body);
-        const title = input === null ? null : asString(input.title);
+        if (input === null) {
+          sendError(res, 422, 'Title is required');
+          return true;
+        }
+        const title = asString(input.title);
         if (title === null || title === '') {
           sendError(res, 422, 'Title is required');
           return true;
@@ -971,9 +983,13 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, ctx:
       }
       if (method === 'POST') {
         const input = asRecord(body);
-        const title = input === null ? null : asString(input.title);
-        const head = input === null ? null : asString(input.head);
-        const base = input === null ? null : asString(input.base);
+        if (input === null) {
+          sendError(res, 422, 'Title is required');
+          return true;
+        }
+        const title = asString(input.title);
+        const head = asString(input.head);
+        const base = asString(input.base);
         if (title === null || title === '') {
           sendError(res, 422, 'Title is required');
           return true;
@@ -1172,7 +1188,7 @@ async function handleContents(
     }
     const bytes = Buffer.from(content.replace(/[\r\n\t ]+/g, ''), 'base64');
     const message = input === null || asString(input.message) === null ? `Update ${path}` : (asString(input.message) as string);
-    const baseTree = tip === undefined ? null : treeOfCommit(store, repo, tip);
+    const baseTree = tip === undefined ? null : (treeOfCommit(store, repo, tip) ?? null);
     const existing = baseTree === null ? undefined : blobAtPath(store, repo, baseTree, path);
     if (existing !== undefined) {
       const sha = input === null ? null : asString(input.sha);

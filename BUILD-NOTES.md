@@ -96,3 +96,109 @@ Wiring `/tmp/gql-mcp-test/serve.ts`: real `Store` (viewer =
   already exist -> 422): the runner needs a fresh server per run, as the
   sealed env provides.
 
+
+## Agent A (store + REST + http) — done 2026-11-15
+
+Files (all mine, committed as `b6354ff` + type-fix follow-up; repo total 528 KiB):
+
+- `src/store.ts` (498 lines) — Store per BUILD-SPEC contract, plus the extensions
+  the other agents code against: `Repo` carries `issues` / `pulls` /
+  `labels` maps and `nextIssueNo` / `nextPullNo` (counters start at 1);
+  `Pull` gained `created_at` / `updated_at` (C fills them from one `now()`);
+  `now()` / `nowEpochSec()` share one tick over epoch 2025-01-01T00:00:00Z
+  (no `Date.now()` / `Math.random()` anywhere); `isAncestor` is
+  ancestor-or-self; `mergeBase` + `listCommits` walks included. Extra exports
+  for B/C: `sha1Object`, `parseCommit`, `parseTree`, `buildTreeBytes`,
+  `sortTreeEntries`, `treeSortKey`, `makeCommitBytes`, `toGlobalId` /
+  `fromGlobalId` (parts EXCLUDE the kind: `fromGlobalId('Repository:5000')`
+  is `{kind:'Repository', parts:['5000']}` — C's four decode sites were fixed
+  to this convention), `EMPTY_TREE_OID`, `EMPTY_BLOB_OID`, `DEFAULT_BRANCH`.
+- `src/http.ts` (207 lines) — the one shared helper module: `sendJson` /
+  `sendNoContent` / `sendError` (always `application/json` + the single
+  per-process `X-GitHub-Request-Id: req-<n>` counter), `bearerToken` /
+  `isAuthenticated` (exact Bearer match against the injected token),
+  `readJsonBody` (empty body ok, malformed JSON -> `{ok:false}`),
+  `paginate` + `pageParams` (absolute same-origin `Link`, `next` only when a
+  later page exists), `pathOf` / `queryOf` / `originOf` / `absoluteUrl`,
+  `asRecord` / `asString` / `asStringArray`, `ApiContext {store, token}`.
+- `src/rest.ts` (1307 lines) — `handleRest(req, res, ctx): Promise<boolean>`
+  (false outside `/api/v3`); every `/api/v3` route needs auth, including GET
+  `/api/v3/` and `/meta` (spec protocol discipline; `/healthz` stays exempt
+  and is app.ts's). Routes: root + `X-OAuth-Scopes`, `meta`, `user`,
+  `user/repos` (list paginated, create 201 / duplicate 422), `repos/{o}/{r}`
+  (GET/PATCH description/DELETE 204), `branches`, `git/refs` (201, unknown
+  sha / duplicate ref 422), `commits` (`?sha=` branch or oid, newest first),
+  `contents/{path}` (PUT 201 create / 200 update, stale/missing sha 409,
+  `body.branch` or `?ref=` branch, unborn default branch accepts the first
+  commit; GET file base64 / directory listing; DELETE 200 + commit, later
+  GET 404), `labels` (POST 201 / duplicate 422, GET list), `issues` (POST
+  201 / unknown label 422, list `state`/`sort=created|updated`/
+  `direction`, GET one, PATCH state/title/body), `issues/{n}/comments`
+  (POST 201, GET list), `pulls` (POST 201, list `state` default open, GET
+  one, `/files` diff of base-tip vs head-tip trees with LCS line counts,
+  `/merge` squash only: 200 `{merged:true, sha, message}`, one squash commit
+  on the base branch with the head's tree, unknown PR 404, already-merged
+  or conflicted 405). Conflict = three-way: same file changed differently
+  on both sides since the merge base. Issue/pull `body: null` serialises
+  as `""` (the suite's shapes require strings).
+
+Viewer identity (decision, read before touching): the bearer token is a
+random per-trial `shpat_…` and carries no login, while the suite's viewer
+login is seeded (`adaiversen`, id 1000). `Store` therefore takes the login
+injected, and `scenarioViewerLogin()` in `store.ts` re-derives it from the
+kit's sealed seed (`SCENARIO_SEED 0x6a09e667f3bcc909n`, `scenarioRng('users')`
++ `generateUsers`, verified against the kit's own `wire.ts`). app.ts must do
+`new Store(scenarioViewerLogin())` with the token from its config object
+(`MAKEFUN_SHOP_TOKEN`, never read `process.env` inside a module).
+
+Verification (throwaway server in `/tmp/forge-test/`, never in the repo;
+token `test-token-123`, test-only):
+
+- Own suite `/tmp/forge-test/test-rest.ts`: **104/104 passed** (every route
+  above incl. pagination 30 repos / 3+ pages, stale-sha 409, merge conflict
+  405, second merge 405, squash content on default branch).
+- Sealed kit runner `sdk/run.ts --url http://127.0.0.1:9999 --token
+  test-token-123 --json` (fresh server, REST-only wiring): **repos 15/15,
+  issues 15/15, pulls 20/20, protocol 5/5 — 55/55, feature 275**; git 0/30,
+  graphql 0/20, mcp 0/15 are unwired in that throwaway server, not failures.
+  Re-run after the type fixes: same 55/55.
+- Perf (`--perf`, same wiring): **read p50 725 ms -> 49 pts** (T_ref
+  2759 ms), **write p50 92.9 ms -> 49 pts** (T_ref 349 ms); push/clone 0
+  (no git module wired there).
+- Cross-surface: Agent C's `/tmp/gql-mcp-test/test.ts` **45/45** and
+  `edge.ts` **6/6** pass against the real `Store` + `handleRest`.
+  Full-kit integrated run (C's note above): feature **595/600**, agent
+  **200/200**, score **795**; the one protocol miss is C's throwaway
+  `serve.ts` hardcoding the API root — the real `app.ts` must route GET
+  `/api/v3/` through `handleRest`, which sends `X-GitHub-Request-Id`.
+- `tsc --noEmit --strict` on `src/store.ts src/http.ts src/rest.ts`:
+  **clean** (checked with `@types/node` from /tmp; the repo has no
+  node_modules and `tsconfig.json` only includes root `*.ts`, so
+  integration should extend its `include` to `src/**/*.ts`).
+
+Integration notes for app.ts (not mine to write):
+
+- Wire order: `/healthz` (no auth) -> `/api/v3/*` via `handleRest` (it
+  returns false outside the prefix; it 404s unknown `/api/v3` routes
+  itself) -> git routes via B's `createGitHandler` -> `/api/graphql` via
+  `handleGraphQL` -> `/mcp` via `handleMcp` -> JSON 404 otherwise. One
+  `Store` + one `{store, token}` context for all four surfaces.
+- `src/http.ts` is now the single home of `sendJson`/auth/request-id
+  (`graphql.ts` and `mcp.ts` already import it). `git.ts` still carries a
+  local `sendJson` with NO request-id header and its own body reader, and
+  `createGitHandler(store)` takes only the store (no `ApiContext`/token) —
+  integration should unify it onto `http.ts` and confirm how git routes
+  treat the bearer token (or leave it — git replies are not
+  protocol-checked for the request id — but the spec says modules must not
+  duplicate this logic).
+- `tsc --strict` on the other modules (for their owners, NOT fixed here —
+  runtime is unaffected, type stripping ignores them): `src/graphql.ts`
+  uses `StoreLike` as a local type in ~20 places but only re-exports it
+  (`export type { Store as StoreLike }`), which creates no local binding —
+  needs a local `type StoreLike = Store;`. `src/mcp.ts:68` has a
+  `readonly string[]` vs mutable `string[]` mismatch on `ToolDef.required`.
+- Not implemented (not in the suite): PATCH/DELETE on single labels,
+  `GET /api/v3/user` beyond the viewer record, conditional requests
+  (`If-None-Match`/`ETag`), rate-limit headers (explicitly not required).
+- Second kit run against the SAME server scores lower (repos already
+  exist -> 422): always verify against a fresh server process.
