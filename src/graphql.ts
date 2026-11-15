@@ -34,7 +34,8 @@ import { isAuthenticated, readJsonBody, sendError, sendJson, type ApiContext } f
 export type { ParsedCommit } from './store.ts';
 export type { TreeEntry } from './store.ts';
 /** The store type, by the name the GraphQL/MCP code uses for it. */
-export type { Store as StoreLike };
+type StoreLike = Store;
+export type { StoreLike };
 export type { StoreComment, StoreIssue, StoreLabel, StorePull, StoreRepo, StoreUser };
 /** Handler context: the shared http.ts ApiContext. */
 export type ForgeContext = ApiContext;

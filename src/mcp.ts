@@ -60,7 +60,7 @@ interface ToolDef {
   inputSchema: {
     type: 'object';
     properties: Record<string, Record<string, unknown>>;
-    required: string[];
+    required: readonly string[];
   };
 }
 

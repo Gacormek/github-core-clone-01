@@ -15,8 +15,14 @@
 //      reads.
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+//
+// Why the loops below never give up: the env may still be starting when this process boots (and in
+// local runs MAKEFUN_ENV_URL can point at a dummy that never answers at all). Giving up would kill
+// a trial the env was about to run, so register and waitForDone retry forever with backoff instead
+// of failing — the only exits are "done" from the env, a contract error (400/405 on register), or
+// a missing MAKEFUN_ENV_URL at startup.
 
-import { createApp } from './app.ts';
+import { createApp } from './src/app.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -29,12 +35,15 @@ const REQUEST_TIMEOUT_MS = 30_000;
 /** The first wait between retries, and the longest. */
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
+/** Cap on the backoff exponent: 250ms * 2^8 = 64s would overshoot the cap, so the
+    effective wait saturates at RETRY_MAX_MS after 3 failed attempts (250 -> 500 -> 1000 -> 2000). */
+const MAX_RETRY_EXPONENT = 8;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
 function retryDelay(attempt: number): number {
-  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
+  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, MAX_RETRY_EXPONENT));
 }
 
 /**

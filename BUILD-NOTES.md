@@ -251,3 +251,41 @@ include to `src/**/*.ts` (verified `tsc --strict` on pack.ts + git.ts +
 store.ts + http.ts from /tmp/tscheck with the repo's compiler options:
 exit 0). Never copy kit conformance-client code into the repo — the module
 was written from the spec + protocol traces only.
+
+## Integration agent (2026-11-15) — wiring + minimal fixes to other modules
+
+- `src/app.ts` (new, mine): `createApp()` builds one `Store(scenarioViewerLogin())`
+  + one `ApiContext {store, token: process.env.MAKEFUN_SHOP_TOKEN ?? ''}` shared by
+  all four surfaces. Routing: GET /healthz (no auth) -> /api/v3* via `handleRest`
+  (includes GET /api/v3/ root, so it carries X-GitHub-Request-Id) -> POST /api/graphql
+  -> POST /mcp -> git handler (`createGitHandler(store)`, no auth by design) ->
+  404 JSON. The starter root `app.ts` was deleted; `main.ts` now imports `./src/app.ts`.
+- Minimal fixes to other agents' files (wiring only, no logic changes):
+  - `src/graphql.ts`: `StoreLike` was only re-exported (`export type { Store as
+    StoreLike }`), which creates no local binding — tsc failed at ~20 use sites.
+    Now a real local alias: `type StoreLike = Store; export type { StoreLike };`.
+  - `src/mcp.ts`: `ToolDef.inputSchema.required` was `string[]` but the frozen
+    array is `readonly string[]` (line 68) — now `readonly string[]`.
+  - `tsconfig.json`: `include` widened from `["*.ts"]` to `["*.ts", "src/**/*.ts"]`.
+  - `main.ts`: rewritten in-session (not pasted): same lifecycle logic exactly,
+    import updated to `./src/app.ts`, plus one genuine change — named constant
+    `MAX_RETRY_EXPONENT = 8` replacing the magic `8` in `retryDelay`, and a comment
+    block explaining why register/waitForDone retry forever (env may still be
+    starting; giving up would kill a trial the env was about to run).
+- `tsc --noEmit --strict` (with `@types/node` from /tmp/tscheck): clean, exit 0.
+- Full verification (fresh server per run, token `test-token-123`, test-only):
+  - `sdk/run.ts --json`: **120/120** (git 30, repos 15, issues 15, pulls 20,
+    protocol 5, graphql 20, mcp 15), columns feature 600 + agent 200 + perf 0,
+    score 800.
+  - `sdk/run.ts --perf --json`: **120/120**, perf **184** (push 718.86 ms/40,
+    clone 92.06 ms/44, read 594.18 ms/50, write 78.51 ms/50), score **984**.
+  - Sealed replay (`program/env/server.mjs` + `program/scorer/score.mjs`,
+    no Docker needed): replay 1 **985/1000** (perf 185), replay 2 **974/1000**
+    (perf 174) — perf varies run to run (timing noise), conformance is stable.
+  - Determinism: `export/state.json` from the two sealed replays is
+    **byte-identical** (sha256 a0e98d49854b961230227867235c8615858e006db3763f341ac6154af1445590).
+  - `bundle --dry-run`: 9 Muse app sessions found (incl. this integration session
+    40b61a50-4097-4a9a-b515-3cb3f53c6ef4 + parent b02c871a-661a-401c-960b-bce0013cb89d),
+    1 instruction file (AGENTS.md); warning: 0 usage rows attached — the final
+    bundle needs `--muse-usage` from the muse.db SELECT (parent runs it after all
+    subagents finish); repo.dirty warning clears once this is committed.
