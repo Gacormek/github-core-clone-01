@@ -14,61 +14,22 @@
 // Wire errors: unknown tool -> -32601, missing required argument -> -32602,
 // non-JSON body -> HTTP 400 + -32700, no auth -> HTTP 401. Never HTTP 500.
 //
-// Node 22 stdlib only. Local send/read helpers until src/http.ts lands (see
-// BUILD-NOTES.md). Merge logic is shared with src/graphql.ts.
+// Node 22 stdlib only. The JSON/auth/body helpers come from src/http.ts (one
+// per-process X-GitHub-Request-Id counter); merge logic is shared with
+// src/graphql.ts. Handlers take the shared ApiContext ({store, token}).
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { isAuthenticated, readJsonBody, sendError, sendJson, sendNoContent, type ApiContext } from './http.ts';
 import {
   createIssueInStore,
   createPullInStore,
   mergePullRequestInStore,
   repoGlobalId,
-  type ForgeContext,
   type StoreIssue,
   type StoreLike,
   type StorePull,
   type StoreRepo,
 } from './graphql.ts';
-
-// ---------------------------------------------------------------------------
-// Small HTTP helpers (local until src/http.ts lands; see BUILD-NOTES.md)
-// ---------------------------------------------------------------------------
-
-const JSON_TYPE = 'application/json; charset=utf-8';
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
-
-let requestCounter = 0;
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  requestCounter += 1;
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': `req-${requestCounter}`,
-  });
-  res.end(text);
-}
-
-function sendMessage(res: ServerResponse, status: number, message: string): void {
-  sendJson(res, status, { message });
-}
-
-async function readBody(req: IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buf = chunk as Buffer;
-    size += buf.length;
-    if (size > MAX_BODY_BYTES) throw new Error('request body too large');
-    chunks.push(buf);
-  }
-  return Buffer.concat(chunks).toString('utf8');
-}
-
-function authed(req: IncomingMessage, token: string): boolean {
-  return req.headers.authorization === `Bearer ${token}`;
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -448,29 +409,22 @@ function dispatchRpc(store: StoreLike, request: Record<string, unknown>): Record
  * POST /mcp. Auth first (401), non-JSON body (HTTP 400 + -32700), notifications
  * (202, empty body), everything else a single JSON-RPC response (HTTP 200).
  */
-export async function handleMcp(req: IncomingMessage, res: ServerResponse, ctx: ForgeContext): Promise<void> {
+export async function handleMcp(req: IncomingMessage, res: ServerResponse, ctx: ApiContext): Promise<void> {
   if (req.method !== 'POST') {
-    sendMessage(res, 405, 'Method Not Allowed');
+    sendError(res, 405, 'Method Not Allowed');
     return;
   }
-  if (!authed(req, ctx.token)) {
-    sendMessage(res, 401, 'Requires authentication');
+  if (!isAuthenticated(req, ctx.token)) {
+    sendError(res, 401, 'Requires authentication');
     return;
   }
-  let text: string;
-  try {
-    text = await readBody(req);
-  } catch {
-    sendMessage(res, 400, 'request body too large');
-    return;
-  }
-  let body: unknown;
-  try {
-    body = JSON.parse(text) as unknown;
-  } catch {
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok || parsed.value === undefined) {
+    // A body that is not JSON (or an empty body) is a JSON-RPC parse error.
     sendJson(res, 400, rpcError(null, PARSE_ERROR, 'Parse error'));
     return;
   }
+  const body: unknown = parsed.value;
   if (Array.isArray(body)) {
     sendJson(res, 400, rpcError(null, INVALID_REQUEST, 'batch requests are not supported'));
     return;
@@ -481,8 +435,7 @@ export async function handleMcp(req: IncomingMessage, res: ServerResponse, ctx: 
   }
   const answer = dispatchRpc(ctx.store, body);
   if (answer === null) {
-    res.writeHead(202, { 'x-github-request-id': `req-${(requestCounter += 1)}` });
-    res.end();
+    sendNoContent(res, 202);
     return;
   }
   sendJson(res, 200, answer);

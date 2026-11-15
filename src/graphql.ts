@@ -10,144 +10,39 @@
 // Unknown repository -> {data: {repository: null}} with no errors key.
 // Batched JSON array bodies -> array of per-operation results, in order.
 //
-// Node 22 stdlib only. No import of src/store.ts: the store is typed structurally
-// (StoreLike) against the BUILD-SPEC contract plus the two maps documented in
-// BUILD-NOTES.md (Repo.issues / Repo.pulls), so the real Store class satisfies it
-// without a code change here.
+// Node 22 stdlib only. The store, its git-object parsers and its global-id
+// helpers come from src/store.ts; the JSON/auth/body helpers from src/http.ts.
+// Handlers take the shared ApiContext ({store, token}) app.ts passes in.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import {
+  fromGlobalId,
+  parseCommit,
+  parseTree,
+  toGlobalId,
+  type Comment as StoreComment,
+  type Issue as StoreIssue,
+  type Label as StoreLabel,
+  type Pull as StorePull,
+  type Repo as StoreRepo,
+  type Store,
+  type TreeEntry,
+  type User as StoreUser,
+} from './store.ts';
+import { isAuthenticated, readJsonBody, sendError, sendJson, type ApiContext } from './http.ts';
 
-// ---------------------------------------------------------------------------
-// Store contract (structural; mirrors BUILD-SPEC + BUILD-NOTES.md additions)
-// ---------------------------------------------------------------------------
-
-export interface StoreUser {
-  id: number;
-  login: string;
-  type: 'User' | 'Organization';
-}
-
-export interface StoreLabel {
-  id: number;
-  name: string;
-  color: string;
-}
-
-export interface StoreComment {
-  id: number;
-  body: string;
-  created_at: string;
-}
-
-export interface StoreIssue {
-  id: number;
-  number: number;
-  title: string;
-  body: string | null;
-  state: 'open' | 'closed';
-  labels: StoreLabel[];
-  comments: StoreComment[];
-  created_at: string;
-  updated_at: string;
-}
-
-export interface StorePull {
-  id: number;
-  number: number;
-  title: string;
-  body: string | null;
-  state: 'open' | 'closed';
-  merged: boolean;
-  merged_at: string | null;
-  merge_commit_sha: string | null;
-  head: { ref: string; sha: string };
-  base: { ref: string; sha: string };
-}
-
-export interface StoreRepo {
-  id: number;
-  name: string;
-  full_name: string;
-  owner: StoreUser;
-  private: boolean;
-  description: string | null;
-  default_branch: string;
-  created_at: string;
-  updated_at: string;
-  objects: Map<string, { type: string; bytes: Buffer }>;
-  refs: Map<string, string>;
-  issues: Map<number, StoreIssue>;
-  pulls: Map<number, StorePull>;
-}
-
-export interface StoreLike {
-  viewer: StoreUser;
-  repos: Map<string, StoreRepo>;
-  createRepo(name: string, opts: { private?: boolean; description?: string | null }): StoreRepo | null;
-  getRepo(owner: string, name: string): StoreRepo | undefined;
-  nextIssueNumber(repo: StoreRepo): number;
-  nextPullNumber(repo: StoreRepo): number;
-  nextId(): number;
-  now(): string;
-  getObject(repo: StoreRepo, oid: string): { type: string; bytes: Buffer } | undefined;
-  putObject(repo: StoreRepo, type: string, bytes: Buffer): string;
-  getRef(repo: StoreRepo, ref: string): string | undefined;
-  setRef(repo: StoreRepo, ref: string, oid: string): void;
-  isAncestor(repo: StoreRepo, ancestorOid: string, tipOid: string): boolean;
-}
-
-/** What app.ts passes in: the shared store plus the bearer token to enforce. */
-export interface ForgeContext {
-  store: StoreLike;
-  token: string;
-}
-
-// ---------------------------------------------------------------------------
-// Small HTTP helpers (local until src/http.ts lands; see BUILD-NOTES.md)
-// ---------------------------------------------------------------------------
-
-const JSON_TYPE = 'application/json; charset=utf-8';
-const MAX_BODY_BYTES = 8 * 1024 * 1024;
-
-let requestCounter = 0;
-
-function nextRequestId(): string {
-  requestCounter += 1;
-  return `req-${requestCounter}`;
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': nextRequestId(),
-  });
-  res.end(text);
-}
-
-function sendMessage(res: ServerResponse, status: number, message: string): void {
-  sendJson(res, status, { message });
-}
-
-async function readBody(req: IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buf = chunk as Buffer;
-    size += buf.length;
-    if (size > MAX_BODY_BYTES) throw new Error('request body too large');
-    chunks.push(buf);
-  }
-  return Buffer.concat(chunks).toString('utf8');
-}
-
-function authed(req: IncomingMessage, token: string): boolean {
-  return req.headers.authorization === `Bearer ${token}`;
-}
+export type { ParsedCommit } from './store.ts';
+export type { TreeEntry } from './store.ts';
+/** The store type, by the name the GraphQL/MCP code uses for it. */
+export type { Store as StoreLike };
+export type { StoreComment, StoreIssue, StoreLabel, StorePull, StoreRepo, StoreUser };
+/** Handler context: the shared http.ts ApiContext. */
+export type ForgeContext = ApiContext;
 
 // ---------------------------------------------------------------------------
 // Opaque global ids: base64url of "<Kind>:<ids...>" — never the raw database id.
+// Built on the store's toGlobalId/fromGlobalId so REST node_id and GraphQL id
+// are the same value.
 // ---------------------------------------------------------------------------
 
 function b64encode(text: string): string {
@@ -164,23 +59,23 @@ function b64decode(text: string): string | null {
 }
 
 export function repoGlobalId(repo: StoreRepo): string {
-  return b64encode(`Repository:${repo.id}`);
+  return toGlobalId('Repository', repo.id);
 }
 
 export function issueGlobalId(repo: StoreRepo, issue: StoreIssue): string {
-  return b64encode(`Issue:${repo.id}:${issue.number}`);
+  return toGlobalId('Issue', repo.id, issue.number);
 }
 
 export function pullGlobalId(repo: StoreRepo, pull: StorePull): string {
-  return b64encode(`PullRequest:${repo.id}:${pull.number}`);
+  return toGlobalId('PullRequest', repo.id, pull.number);
 }
 
 export function commentGlobalId(comment: StoreComment): string {
-  return b64encode(`IssueComment:${comment.id}`);
+  return toGlobalId('IssueComment', comment.id);
 }
 
 export function userGlobalId(user: StoreUser): string {
-  return b64encode(`User:${user.id}`);
+  return toGlobalId('User', user.id);
 }
 
 interface DecodedId {
@@ -191,16 +86,22 @@ interface DecodedId {
 /** Decode a global id; null when it is not one of ours. */
 export function decodeGlobalId(id: unknown): DecodedId | null {
   if (typeof id !== 'string') return null;
-  const text = b64decode(id);
-  if (text === null) return null;
-  const parts = text.split(':');
-  const kind = parts[0];
-  if (kind !== 'Repository' && kind !== 'Issue' && kind !== 'PullRequest' && kind !== 'IssueComment' && kind !== 'User') return null;
-  return { kind, parts };
+  const decoded = fromGlobalId(id);
+  if (decoded === null) return null;
+  if (
+    decoded.kind !== 'Repository' &&
+    decoded.kind !== 'Issue' &&
+    decoded.kind !== 'PullRequest' &&
+    decoded.kind !== 'IssueComment' &&
+    decoded.kind !== 'User'
+  ) {
+    return null;
+  }
+  return decoded;
 }
 
 /** Find a repository by numeric database id (scan: repos are keyed owner/name). */
-export function findRepoById(store: StoreLike, dbid: number): StoreRepo | undefined {
+export function findRepoById(store: Store, dbid: number): StoreRepo | undefined {
   for (const repo of store.repos.values()) {
     if (repo.id === dbid) return repo;
   }
@@ -223,50 +124,9 @@ export function decodeCursor(cursor: unknown): number | null {
 // ---------------------------------------------------------------------------
 // Git object helpers: tree/commit parsing, flattening, diffing, squash merge.
 // Only what GraphQL needs (PR files, mergeable, mergePullRequest). No tree
-// building: a squash commit reuses the head tree oid verbatim.
+// building: a squash commit reuses the head tree oid verbatim. Tree/commit
+// parsing comes from the store module, so every surface parses bytes alike.
 // ---------------------------------------------------------------------------
-
-export interface TreeEntry {
-  mode: string;
-  name: string;
-  oid: string;
-}
-
-/** Parse a tree object's raw bytes into entries. */
-export function parseTree(bytes: Buffer): TreeEntry[] {
-  const entries: TreeEntry[] = [];
-  let offset = 0;
-  while (offset < bytes.length) {
-    const space = bytes.indexOf(0x20, offset);
-    if (space < 0) break;
-    const nul = bytes.indexOf(0x00, space + 1);
-    if (nul < 0 || nul + 21 > bytes.length) break;
-    const mode = bytes.toString('utf8', offset, space);
-    const name = bytes.toString('utf8', space + 1, nul);
-    const oid = bytes.subarray(nul + 1, nul + 21).toString('hex');
-    entries.push({ mode, name, oid });
-    offset = nul + 21;
-  }
-  return entries;
-}
-
-export interface ParsedCommit {
-  tree: string;
-  parents: string[];
-}
-
-/** Parse a commit object's header (tree + parents). */
-export function parseCommit(bytes: Buffer): ParsedCommit {
-  const text = bytes.toString('utf8');
-  const head = text.split('\n\n', 1)[0] ?? '';
-  let tree = '';
-  const parents: string[] = [];
-  for (const line of head.split('\n')) {
-    if (line.startsWith('tree ')) tree = line.slice(5).trim();
-    else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
-  }
-  return { tree, parents };
-}
 
 /** Flatten a tree (recursively) to path -> {oid, mode}. Missing tree -> empty map. */
 export function flattenTree(store: StoreLike, repo: StoreRepo, treeOid: string, prefix: string, out: Map<string, { oid: string; mode: string }>): void {
@@ -1001,6 +861,7 @@ export function createPullInStore(
   baseSha: string,
 ): StorePull {
   const number = store.nextPullNumber(repo);
+  const ts = store.now();
   const pull: StorePull = {
     id: store.nextId(),
     number,
@@ -1012,6 +873,8 @@ export function createPullInStore(
     merge_commit_sha: null,
     head: { ref: headRef, sha: headSha },
     base: { ref: baseRef, sha: baseSha },
+    created_at: ts,
+    updated_at: ts,
   };
   repo.pulls.set(number, pull);
   return pull;
@@ -1025,32 +888,32 @@ function inputOf(field: FieldNode, state: ExecState): Record<string, unknown> {
 
 function repoFromGlobalId(store: StoreLike, id: unknown, what: string): StoreRepo {
   const decoded = decodeGlobalId(id);
-  if (decoded === null || decoded.kind !== 'Repository' || decoded.parts.length !== 2) {
+  if (decoded === null || decoded.kind !== 'Repository' || decoded.parts.length !== 1) {
     throw new GqlError(`${what} is not a repository id`);
   }
-  const repo = findRepoById(store, Number(decoded.parts[1]));
+  const repo = findRepoById(store, Number(decoded.parts[0]));
   if (repo === undefined) throw new GqlError(`repository not found for ${what}`);
   return repo;
 }
 
 function issueFromGlobalId(store: StoreLike, id: unknown, what: string): IssueRef {
   const decoded = decodeGlobalId(id);
-  if (decoded === null || decoded.kind !== 'Issue' || decoded.parts.length !== 3) {
+  if (decoded === null || decoded.kind !== 'Issue' || decoded.parts.length !== 2) {
     throw new GqlError(`${what} is not an issue id`);
   }
-  const repo = findRepoById(store, Number(decoded.parts[1]));
-  const issue = repo?.issues.get(Number(decoded.parts[2]));
+  const repo = findRepoById(store, Number(decoded.parts[0]));
+  const issue = repo?.issues.get(Number(decoded.parts[1]));
   if (repo === undefined || issue === undefined) throw new GqlError(`issue not found for ${what}`);
   return { repo, issue };
 }
 
 function pullFromGlobalId(store: StoreLike, id: unknown, what: string): PullRef {
   const decoded = decodeGlobalId(id);
-  if (decoded === null || decoded.kind !== 'PullRequest' || decoded.parts.length !== 3) {
+  if (decoded === null || decoded.kind !== 'PullRequest' || decoded.parts.length !== 2) {
     throw new GqlError(`${what} is not a pull request id`);
   }
-  const repo = findRepoById(store, Number(decoded.parts[1]));
-  const pull = repo?.pulls.get(Number(decoded.parts[2]));
+  const repo = findRepoById(store, Number(decoded.parts[0]));
+  const pull = repo?.pulls.get(Number(decoded.parts[1]));
   if (repo === undefined || pull === undefined) throw new GqlError(`pull request not found for ${what}`);
   return { repo, pull };
 }
@@ -1135,17 +998,17 @@ function resolveField(typename: string, value: unknown, field: FieldNode, state:
           const decoded = decodeGlobalId(args.id);
           if (decoded === null) return null;
           if (decoded.kind === 'Repository') {
-            const repo = findRepoById(store, Number(decoded.parts[1]));
+            const repo = findRepoById(store, Number(decoded.parts[0]));
             return repo === undefined ? null : { t: 'Repository', v: repo };
           }
           if (decoded.kind === 'Issue') {
-            const repo = findRepoById(store, Number(decoded.parts[1]));
-            const issue = repo?.issues.get(Number(decoded.parts[2]));
+            const repo = findRepoById(store, Number(decoded.parts[0]));
+            const issue = repo?.issues.get(Number(decoded.parts[1]));
             return repo === undefined || issue === undefined ? null : { t: 'Issue', v: { repo, issue } as IssueRef };
           }
           if (decoded.kind === 'PullRequest') {
-            const repo = findRepoById(store, Number(decoded.parts[1]));
-            const pull = repo?.pulls.get(Number(decoded.parts[2]));
+            const repo = findRepoById(store, Number(decoded.parts[0]));
+            const pull = repo?.pulls.get(Number(decoded.parts[1]));
             return repo === undefined || pull === undefined ? null : { t: 'PullRequest', v: { repo, pull } as PullRef };
           }
           return null;
@@ -1355,7 +1218,7 @@ function resolveField(typename: string, value: unknown, field: FieldNode, state:
       const label = value as StoreLabel;
       switch (field.name) {
         case 'id':
-          return { t: null, v: b64encode(`Label:${label.id}`) };
+          return { t: null, v: toGlobalId('Label', label.id) };
         case 'name':
           return { t: null, v: label.name };
         case 'color':
@@ -1571,29 +1434,21 @@ function operationInput(entry: unknown): GraphQLOperationInput | null {
  * POST /api/graphql. Single object body or a JSON array of operations (batched).
  * Auth first (401), malformed JSON (400); GraphQL-level failures are HTTP 200.
  */
-export async function handleGraphQL(req: IncomingMessage, res: ServerResponse, ctx: ForgeContext): Promise<void> {
+export async function handleGraphQL(req: IncomingMessage, res: ServerResponse, ctx: ApiContext): Promise<void> {
   if (req.method !== 'POST') {
-    sendMessage(res, 405, 'Method Not Allowed');
+    sendError(res, 405, 'Method Not Allowed');
     return;
   }
-  if (!authed(req, ctx.token)) {
-    sendMessage(res, 401, 'Requires authentication');
+  if (!isAuthenticated(req, ctx.token)) {
+    sendError(res, 401, 'Requires authentication');
     return;
   }
-  let text: string;
-  try {
-    text = await readBody(req);
-  } catch {
-    sendMessage(res, 400, 'request body too large');
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) {
+    sendError(res, 400, parsed.error);
     return;
   }
-  let body: unknown;
-  try {
-    body = JSON.parse(text) as unknown;
-  } catch {
-    sendMessage(res, 400, 'request body is not valid JSON');
-    return;
-  }
+  const body: unknown = parsed.value;
   try {
     if (Array.isArray(body)) {
       const results = body.map((entry) => {
@@ -1607,11 +1462,11 @@ export async function handleGraphQL(req: IncomingMessage, res: ServerResponse, c
     }
     const op = operationInput(body);
     if (op === null) {
-      sendMessage(res, 400, 'a query string is required');
+      sendError(res, 400, 'a query string is required');
       return;
     }
     sendJson(res, 200, executeGraphQL(ctx.store, op));
   } catch (err) {
-    sendMessage(res, 500, err instanceof Error ? err.message : 'internal error');
+    sendError(res, 500, err instanceof Error ? err.message : 'internal error');
   }
 }
