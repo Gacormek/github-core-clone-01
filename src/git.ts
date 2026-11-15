@@ -21,14 +21,16 @@
 //   - Malformed input never crashes the handler: it answers 400 JSON and the
 //     server keeps serving.
 //
-// No import of src/store.ts: the store is typed structurally (GitStore/GitRepo)
-// against the BUILD-SPEC contract, so the real Store class satisfies it.
-// Local sendJson/readBody helpers are temporary until src/http.ts lands;
-// integration should unify them (see BUILD-NOTES.md).
+// Store and JSON replies come from the real modules: `Store`/`Repo` from
+// src/store.ts (Agent A) and `sendJson` from src/http.ts (Agent A).
+// `sendBuffer`/`readBody` stay local: http.ts has no binary-body equivalents
+// (readJsonBody is JSON-only), and git speaks raw pkt-line bytes.
 //
 // Node 22 stdlib only. Never process.exit, never binds a port, never reads env.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { sendJson } from './http.ts';
+import type { Repo, Store } from './store.ts';
 import {
   ZERO_OID,
   encodePktLine,
@@ -38,6 +40,7 @@ import {
   isObjectId,
   parseTag,
   parseTree,
+  pktLineDelim,
   pktLineFlush,
   readPack,
   verifyPackChecksum,
@@ -46,48 +49,19 @@ import {
 import type { GitObject, GitObjectType } from './pack.ts';
 
 // ---------------------------------------------------------------------------
-// Store contract (structural; mirrors BUILD-SPEC src/store.ts)
+// Store contract: the real Store/Repo types, aliased so older references to
+// GitStore/GitRepo keep working. The Store class satisfies every method the
+// git surface needs (getRepo/getObject/putObject/getRef/setRef/deleteRef/
+// isAncestor, where isAncestor returns true when ancestor == tip).
 // ---------------------------------------------------------------------------
 
-export interface GitUser {
-  id: number;
-  login: string;
-  type: 'User' | 'Organization';
-}
-
-export interface GitRepo {
-  id: number;
-  name: string;
-  full_name: string;
-  owner: GitUser;
-  private: boolean;
-  description: string | null;
-  default_branch: string;
-  created_at: string;
-  updated_at: string;
-  objects: Map<string, { type: string; bytes: Buffer }>;
-  refs: Map<string, string>;
-}
-
-export interface GitStore {
-  getRepo(owner: string, name: string): GitRepo | undefined;
-  getObject(repo: GitRepo, oid: string): { type: string; bytes: Buffer } | undefined;
-  putObject(repo: GitRepo, type: string, bytes: Buffer): string;
-  getRef(repo: GitRepo, ref: string): string | undefined;
-  setRef(repo: GitRepo, ref: string, oid: string): void;
-  deleteRef(repo: GitRepo, ref: string): boolean;
-  isAncestor(repo: GitRepo, ancestorOid: string, tipOid: string): boolean;
-}
+export type GitUser = Repo['owner'];
+export type GitRepo = Repo;
+export type GitStore = Store;
 
 // ---------------------------------------------------------------------------
-// Local HTTP helpers (temporary; src/http.ts owns these at integration)
+// Local HTTP helpers (http.ts has no binary equivalents)
 // ---------------------------------------------------------------------------
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) });
-  res.end(text);
-}
 
 function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
@@ -416,6 +390,10 @@ interface FetchPlan {
  * d holds their parents at distance d; generations 0..depth-1 are included.
  * The client's `shallow` boundaries truncate the have-closure: the client
  * holds those commits but not their parents.
+ * With `deepen-relative` (real git's `fetch --deepen`), the depth is
+ * relative to the client's shallow boundary: the effective absolute depth is
+ * depth + 1 + (deepest reachable boundary generation), so one relative step
+ * past a boundary at generation 0 includes generations 0..1.
  */
 function planFetch(
   store: GitStore,
@@ -424,6 +402,7 @@ function planFetch(
   haves: string[],
   clientShallow: string[],
   depth: number | null,
+  deepenRelative = false,
 ): FetchPlan {
   const stopAt = new Set(clientShallow);
   const haveReachable = collectReachable(store, repo, haves, { stopAt, allowMissing: true });
@@ -452,10 +431,37 @@ function planFetch(
       included.set(oid, obj);
     }
   } else {
+    let effectiveDepth = depth;
+    if (deepenRelative) {
+      // Generation of each boundary = its BFS distance from the wants.
+      const genOf = new Map<string, number>();
+      const order: string[] = [...new Set(wantCommits)];
+      const visited = new Set<string>(order);
+      for (const oid of order) genOf.set(oid, 0);
+      for (let head = 0; head < order.length; head += 1) {
+        const oid = order[head];
+        const g = genOf.get(oid)!;
+        const obj = getTypedObject(store, repo, oid);
+        if (!obj || obj.type !== 'commit') continue;
+        for (const parent of commitLinks(obj.data).parents) {
+          if (!visited.has(parent)) {
+            visited.add(parent);
+            genOf.set(parent, g + 1);
+            order.push(parent);
+          }
+        }
+      }
+      let deepest = -1;
+      for (const b of stopAt) {
+        const g = genOf.get(b);
+        if (g !== undefined && g > deepest) deepest = g;
+      }
+      effectiveDepth = depth + 1 + deepest;
+    }
     // BFS by generation over commits; trees/blobs of included commits join too.
     let frontier = [...new Set(wantCommits)];
     const includedCommits = new Set<string>();
-    for (let gen = 0; gen < depth && frontier.length; gen += 1) {
+    for (let gen = 0; gen < effectiveDepth && frontier.length; gen += 1) {
       const next: string[] = [];
       for (const oid of frontier) {
         if (includedCommits.has(oid)) continue;
@@ -469,7 +475,7 @@ function planFetch(
           }
         }
         included.set(oid, obj);
-        if (gen === depth - 1) boundary.add(oid);
+        if (gen === effectiveDepth - 1) boundary.add(oid);
         else for (const parent of parents) next.push(parent);
       }
       frontier = [...new Set(next)];
@@ -500,10 +506,8 @@ function planFetch(
 
   const acks: string[] = [];
   for (const have of haves) {
-    if (!getTypedObject(store, repo, have)) continue;
-    if (haveReachable.has(have) && wants.some((w) => w === have || safeIsAncestor(store, repo, have, w))) {
-      acks.push(have);
-    }
+    // Real git ACKs every have the server holds, ancestor or not.
+    if (getTypedObject(store, repo, have)) acks.push(have);
   }
 
   return { send, shallow: [...boundary], unshallow, acks };
@@ -582,13 +586,19 @@ interface FetchArgs {
   haves: string[];
   shallow: string[];
   depth: number | null;
+  /** True when the request ends with `done` (negotiation is complete). */
+  done: boolean;
+  /** `deepen-relative`: deepen is relative to the client's shallow boundary. */
+  deepenRelative: boolean;
 }
 
 function parseFetchArgs(lines: string[]): FetchArgs {
-  const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null };
+  const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, done: false, deepenRelative: false };
   for (const line of lines) {
     const text = line.replace(/\n$/, '');
-    if (text.startsWith('want ')) {
+    if (text === 'done') args.done = true;
+    else if (text === 'deepen-relative') args.deepenRelative = true;
+    else if (text.startsWith('want ')) {
       const oid = text.slice(5, 45);
       if (isObjectId(oid)) args.wants.push(oid);
     } else if (text.startsWith('have ')) {
@@ -623,49 +633,67 @@ function handleFetchV2(
   args.wants = uniq(args.wants);
   args.haves = uniq(args.haves);
   args.shallow = uniq(args.shallow);
+  // Response shape, verified byte-for-byte against real git upload-pack v2
+  // (GIT_PROTOCOL=version=2 git upload-pack --stateless-rpc):
+  //  - With `done` there is NO acknowledgments section.
+  //  - Without `done`: ACKs + `ready` (packfile follows), or a lone `NAK`
+  //    and nothing else — the client sends another request with more haves.
+  //  - The acknowledgments section ends with a DELIM (0001) when `ready`
+  //    was sent (fetch-pack.c process_ack: after `ready` a DELIM must
+  //    follow, else it dies "expected packfile to be sent after 'ready'"),
+  //    and with a FLUSH (0000) in the NAK-only case. The shallow-info
+  //    section (lines with NO trailing newline) likewise ends with a DELIM
+  //    before the packfile section. (The kit client treats flush and delim
+  //    alike as section resets, so both peers accept this shape.)
+  const sendPackfile = (parts: Buffer[], plan: FetchPlan): void => {
+    if (args.depth !== null) {
+      // Real git writes shallow/unshallow lines with NO trailing newline.
+      parts.push(encodePktLine('shallow-info\n'));
+      for (const oid of plan.shallow) parts.push(encodePktLine(`shallow ${oid}`));
+      for (const oid of plan.unshallow) parts.push(encodePktLine(`unshallow ${oid}`));
+      parts.push(pktLineDelim());
+    }
+    parts.push(encodePktLine('packfile\n'));
+    parts.push(encodeSideband(1, packForPlan(plan)));
+    parts.push(pktLineFlush());
+    sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  };
   if (args.wants.length === 0) {
-    // No wants: an empty, well-formed response (the client never sends this,
-    // but a bare POST must not hang).
-    sendBuffer(
-      res,
-      200,
-      'application/x-git-upload-pack-result',
-      Buffer.concat([encodePktLines(['acknowledgments\n', 'NAK\n']), pktLineFlush()]),
-    );
+    // No wants: an empty packfile section (the client never sends this).
+    const empty: FetchPlan = { send: new Map(), shallow: [], unshallow: [], acks: [] };
+    sendPackfile([], empty);
     return;
   }
   let plan: FetchPlan;
   try {
-    plan = planFetch(store, repo, args.wants, args.haves, args.shallow, args.depth);
+    plan = planFetch(store, repo, args.wants, args.haves, args.shallow, args.depth, args.deepenRelative);
   } catch (err) {
     // Unknown want: report it on the error band inside the packfile section.
-    const parts: Buffer[] = [encodePktLines(['acknowledgments\n', 'NAK\n']), pktLineFlush()];
+    const parts: Buffer[] = [];
     parts.push(encodePktLine('packfile\n'));
     parts.push(encodeSideband(3, Buffer.from(`ERR ${(err as Error).message}\n`, 'utf8')));
     parts.push(pktLineFlush());
     sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
     return;
   }
-  const pack = packForPlan(plan);
-  const parts: Buffer[] = [];
-  parts.push(encodePktLine('acknowledgments\n'));
-  if (plan.acks.length) {
+  if (!args.done) {
+    if (plan.acks.length === 0) {
+      sendBuffer(
+        res,
+        200,
+        'application/x-git-upload-pack-result',
+        Buffer.concat([encodePktLines(['acknowledgments\n', 'NAK\n']), pktLineFlush()]),
+      );
+      return;
+    }
+    const parts: Buffer[] = [encodePktLine('acknowledgments\n')];
     for (const ack of plan.acks) parts.push(encodePktLine(`ACK ${ack}\n`));
     parts.push(encodePktLine('ready\n'));
-  } else {
-    parts.push(encodePktLine('NAK\n'));
+    parts.push(pktLineDelim());
+    sendPackfile(parts, plan);
+    return;
   }
-  parts.push(pktLineFlush());
-  if (args.depth !== null) {
-    parts.push(encodePktLine('shallow-info\n'));
-    for (const oid of plan.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) parts.push(encodePktLine(`unshallow ${oid}\n`));
-    parts.push(pktLineFlush());
-  }
-  parts.push(encodePktLine('packfile\n'));
-  parts.push(encodeSideband(1, pack));
-  parts.push(pktLineFlush());
-  sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  sendPackfile([], plan);
 }
 
 function handleFetchV0(
@@ -684,7 +712,7 @@ function handleFetchV0(
   }
   let plan: FetchPlan;
   try {
-    plan = planFetch(store, repo, args.wants, args.haves, args.shallow, args.depth);
+    plan = planFetch(store, repo, args.wants, args.haves, args.shallow, args.depth, args.deepenRelative);
   } catch (err) {
     const parts: Buffer[] = [encodePktLine('NAK\n')];
     parts.push(encodeSideband(3, Buffer.from(`ERR ${(err as Error).message}\n`, 'utf8')));

@@ -202,3 +202,52 @@ Integration notes for app.ts (not mine to write):
   (`If-None-Match`/`ETag`), rate-limit headers (explicitly not required).
 - Second kit run against the SAME server scores lower (repos already
   exist -> 422): always verify against a fresh server process.
+
+## Agent B (git) — final integration notes (2026-11-15)
+
+`src/git.ts` now imports the real modules: `Store`/`Repo` from `src/store.ts`
+(`GitStore`/`GitRepo` are kept as exported type aliases) and `sendJson` from
+`src/http.ts` (so git JSON replies now carry the standard
+`x-github-request-id`). `sendBuffer`/`readBody` stay local in `git.ts`:
+http.ts has no binary-body equivalents (`readJsonBody` is JSON-only) and git
+speaks raw pkt-line bytes. `createGitHandler(store)` signature unchanged;
+git routes are unauthenticated by design — the kit's git client sends no
+bearer token, and the 30 git checks require no auth.
+
+Verified 2026-11-15, all against the real `Store` (throwaway server in
+/tmp/gittest, `server-real2.ts`, viewer `adaiversen`):
+
+- Official kit runner `sdk/run.ts --json`: **git group 30/30 PASS**
+  (repos/issues/pulls/protocol/graphql/mcp groups fail on the throwaway
+  server — it has no REST beyond repo-create, no GraphQL, no MCP; not
+  this module). Re-run on a fresh server: the runner's checks create their
+  own `gitconf-*` repos via REST, and a second run 422s on existing repos.
+- Real git 2.43.0: full clone (fsck OK), shallow `--depth 1`, `fetch
+  --deepen=1` (boundary moves to parent), incremental fetch (3rd commit),
+  non-FF push rejected `(non-fast-forward)`, branch create/delete, tag
+  delete, v0 clone + v0 fetch (fsck OK).
+- Pack unit tests `/tmp/gittest/test-pack.ts`: 21/21 — OFS_DELTA and
+  REF_DELTA round-trip, thin-pack resolve via `resolveBase`, trailer
+  corruption detected, oversized/truncated/non-hex pkt-line rejected.
+
+Protocol ground truth (verified against git 2.43 `fetch-pack.c` + byte
+traces, NOT the kit client — the kit tolerates shapes real git rejects):
+
+- v2 fetch response sections: `acknowledgments` ends with a DELIM (0001)
+  when `ready` was sent (a flush there dies with "expected packfile to be
+  sent after 'ready'"); NAK-only ends with a FLUSH and nothing else.
+  `shallow-info` lines carry NO trailing newline and the section ends with
+  a DELIM before `packfile`. A double delim after `ready` dies with
+  "expected 'packfile'" — do not add a separator delim before
+  shallow-info/packfile when a section already ended with one.
+- `deepen-relative`: depth is relative to the client's shallow boundary
+  (effective depth = depth + 1 + deepest reachable boundary generation),
+  NOT absolute like the kit client's `deepen N`.
+- Real git's fetch `want` may be a tag object (fetch --deepen=1 wants the
+  tag oid); `planFetch` peels tag wants to their commit for the walk.
+
+`tsconfig.json` still includes only root `*.ts`; integration must widen the
+include to `src/**/*.ts` (verified `tsc --strict` on pack.ts + git.ts +
+store.ts + http.ts from /tmp/tscheck with the repo's compiler options:
+exit 0). Never copy kit conformance-client code into the repo — the module
+was written from the spec + protocol traces only.
